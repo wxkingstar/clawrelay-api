@@ -153,14 +153,30 @@ type ClaudeEvent struct {
 // StreamAPIEvent represents the inner event of a stream_event wrapper,
 // mirroring Anthropic's Messages API streaming events.
 type StreamAPIEvent struct {
-	Type  string          `json:"type"` // message_start, content_block_delta, etc.
-	Index int             `json:"index,omitempty"`
-	Delta json.RawMessage `json:"delta,omitempty"`
+	Type         string          `json:"type"` // message_start, content_block_start, content_block_delta, etc.
+	Index        int             `json:"index,omitempty"`
+	Delta        json.RawMessage `json:"delta,omitempty"`
+	ContentBlock json.RawMessage `json:"content_block,omitempty"`
+}
+
+// StreamContentBlock represents the content_block field in content_block_start events.
+type StreamContentBlock struct {
+	Type string `json:"type"` // "text" or "tool_use"
+	ID   string `json:"id,omitempty"`
+	Name string `json:"name,omitempty"`
 }
 
 type StreamTextDelta struct {
-	Type string `json:"type"` // text_delta
-	Text string `json:"text"`
+	Type        string `json:"type"` // text_delta, input_json_delta
+	Text        string `json:"text,omitempty"`
+	PartialJSON string `json:"partial_json,omitempty"`
+}
+
+// nativeToolCall tracks a tool_use content block from Claude CLI's stream output.
+type nativeToolCall struct {
+	ID   string
+	Name string
+	Args strings.Builder
 }
 
 type ClaudeMessage struct {
@@ -339,20 +355,14 @@ func setOAICORSHeaders(w http.ResponseWriter, r *http.Request) {
 // ---- Tool support ----
 
 // buildToolPrompt formats tool definitions for injection into the system prompt.
+// Claude will use native tool_use to call these; we intercept from the stream.
 func buildToolPrompt(tools []Tool) string {
 	if len(tools) == 0 {
 		return ""
 	}
 	var sb strings.Builder
-	sb.WriteString("\n\n# Tools\n\n")
-	sb.WriteString("You have the following tools available. To call a tool, you MUST use this exact format (no markdown code fences):\n\n")
-	sb.WriteString("<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param1\": \"value1\"}}\n</tool_call>\n\n")
-	sb.WriteString("Rules:\n")
-	sb.WriteString("- Each tool call MUST be wrapped in its own <tool_call></tool_call> block.\n")
-	sb.WriteString("- You MAY include thinking/text before or between tool calls.\n")
-	sb.WriteString("- The JSON inside <tool_call> MUST be valid JSON with \"name\" and \"arguments\" keys.\n")
-	sb.WriteString("- Do NOT nest <tool_call> inside markdown code blocks.\n\n")
-	sb.WriteString("Available tools:\n\n")
+	sb.WriteString("\n\n# Available Tools\n\n")
+	sb.WriteString("You have the following tools available. Call them when needed.\n\n")
 
 	for _, tool := range tools {
 		sb.WriteString(fmt.Sprintf("## %s\n", tool.Function.Name))
@@ -406,6 +416,98 @@ func parseToolCalls(text string) (cleanText string, toolCalls []ToolCall) {
 	cleanText += text[lastEnd:]
 	cleanText = strings.TrimSpace(cleanText)
 	return
+}
+
+// extractNativeToolCalls scans Claude CLI events for tool_use content blocks
+// (from assistant messages) and converts them to OpenAI-format ToolCalls.
+func extractNativeToolCalls(events []ClaudeEvent) []ToolCall {
+	var toolCalls []ToolCall
+	for _, event := range events {
+		if event.Type != "assistant" || event.Message == nil {
+			continue
+		}
+		var msg ClaudeMessage
+		if err := json.Unmarshal(event.Message, &msg); err != nil {
+			continue
+		}
+		for _, c := range msg.Content {
+			if c.Type == "tool_use" && c.Name != "" {
+				args := "{}"
+				if c.Input != nil {
+					args = string(c.Input)
+				}
+				toolCalls = append(toolCalls, ToolCall{
+					ID:   generateToolCallID(),
+					Type: "function",
+					Function: ToolCallFunction{
+						Name:      c.Name,
+						Arguments: args,
+					},
+				})
+			}
+		}
+	}
+	return toolCalls
+}
+
+// toolCallFilter intercepts streaming text to prevent <tool_call>...</tool_call>
+// blocks from being sent as regular content. Safe text is returned immediately;
+// potential tool call blocks are held back until confirmed or the stream ends.
+type toolCallFilter struct {
+	pending    string
+	toolBlocks []string
+}
+
+// Feed adds new text and returns any text that is safe to send as content.
+func (f *toolCallFilter) Feed(text string) string {
+	f.pending += text
+	return f.drain()
+}
+
+func (f *toolCallFilter) drain() string {
+	var safe strings.Builder
+	for len(f.pending) > 0 {
+		idx := strings.Index(f.pending, "<")
+		if idx < 0 {
+			safe.WriteString(f.pending)
+			f.pending = ""
+			break
+		}
+		if idx > 0 {
+			safe.WriteString(f.pending[:idx])
+			f.pending = f.pending[idx:]
+		}
+		// f.pending starts with '<'
+		const openTag = "<tool_call>"
+		if len(f.pending) < len(openTag) {
+			if strings.HasPrefix(openTag, f.pending) {
+				break // might still become <tool_call>, hold
+			}
+			safe.WriteByte('<')
+			f.pending = f.pending[1:]
+			continue
+		}
+		if !strings.HasPrefix(f.pending, openTag) {
+			safe.WriteByte('<')
+			f.pending = f.pending[1:]
+			continue
+		}
+		// Found <tool_call>, look for closing tag
+		const closeTag = "</tool_call>"
+		endIdx := strings.Index(f.pending, closeTag)
+		if endIdx < 0 {
+			break // no end tag yet, keep buffering
+		}
+		block := f.pending[:endIdx+len(closeTag)]
+		f.toolBlocks = append(f.toolBlocks, block)
+		f.pending = f.pending[endIdx+len(closeTag):]
+	}
+	return safe.String()
+}
+
+// Finish flushes remaining pending text and returns collected tool call blocks.
+func (f *toolCallFilter) Finish() (remaining string, blocks []string) {
+	return f.pending, f.toolBlocks
 }
 
 // ---- Message conversion ----
@@ -469,12 +571,10 @@ func extractTextFromEvent(event *ClaudeEvent) string {
 				texts = append(texts, c.Text)
 			}
 		case "tool_use":
-			// Claude CLI's own tool calls — render as readable text
-			desc := fmt.Sprintf("[Tool call: %s]", c.Name)
-			if c.Input != nil {
-				desc = fmt.Sprintf("[Tool call: %s(%s)]", c.Name, string(c.Input))
-			}
-			texts = append(texts, desc)
+			// Claude CLI's own built-in tool calls — suppress from output.
+			// These are internal to Claude Code (Bash, Read, etc.) and should
+			// not leak to the caller as text content.
+			continue
 		}
 	}
 	return strings.Join(texts, "")
@@ -548,9 +648,10 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	args = append(args, "--include-partial-messages")
 	args = append(args, "--permission-mode", "bypassPermissions")
 
-	if req.MaxTokens != nil {
-		args = append(args, "--max-turns", fmt.Sprintf("%d", 1))
-	}
+	// Always limit to 1 turn — our proxy is stateless and tool execution
+	// is managed by the caller (OpenClaw). Prevents Claude from using its
+	// own built-in tools (Bash, Read, Write, etc.) which leak as text.
+	args = append(args, "--max-turns", "1")
 
 	log.Printf("Claude args: %v (prompt length: %d bytes via stdin)", args, len(prompt))
 
@@ -871,10 +972,16 @@ func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args [
 	fmt.Fprintf(w, ": ping\n\n")
 	flusher.Flush()
 
-	// Stream text deltas in real-time while collecting full text for tool call detection
+	// Track text and native tool_use blocks from Claude CLI's stream.
 	var fullText strings.Builder
+	var filter toolCallFilter
 	var streamDeltaSent bool
 	var finalUsage *UsageInfo
+
+	// Native tool_use tracking: Claude calls tools via native tool_use (not XML).
+	// We intercept content_block_start (tool_use) + content_block_delta (input_json_delta).
+	nativeTCs := map[int]*nativeToolCall{}
+	var nativeTCOrder []int
 
 	scanner := bufio.NewScanner(stdout)
 	const maxCapacity = 1024 * 1024
@@ -895,22 +1002,77 @@ func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args [
 			continue
 		}
 
-		// Handle stream_event with content_block_delta for real-time token streaming
+		// Parse stream_event for text deltas and native tool_use blocks
 		if event.Type == "stream_event" && event.Event != nil {
 			var streamEvt StreamAPIEvent
 			if err := json.Unmarshal(event.Event, &streamEvt); err != nil {
 				continue
 			}
-			if streamEvt.Type == "content_block_delta" && streamEvt.Delta != nil {
-				var delta StreamTextDelta
-				if err := json.Unmarshal(streamEvt.Delta, &delta); err != nil {
-					continue
-				}
-				if delta.Type == "text_delta" && delta.Text != "" {
-					streamDeltaSent = true
-					fullText.WriteString(delta.Text)
-					log.Printf("[BUFFERED STREAM DELTA] len=%d content=%q", len(delta.Text), truncate(delta.Text, 200))
 
+			switch streamEvt.Type {
+			case "content_block_start":
+				// Detect tool_use content blocks
+				if streamEvt.ContentBlock != nil {
+					var block StreamContentBlock
+					if err := json.Unmarshal(streamEvt.ContentBlock, &block); err == nil && block.Type == "tool_use" {
+						tc := &nativeToolCall{ID: block.ID, Name: block.Name}
+						nativeTCs[streamEvt.Index] = tc
+						nativeTCOrder = append(nativeTCOrder, streamEvt.Index)
+						log.Printf("[NATIVE TOOL_USE START] index=%d name=%s id=%s", streamEvt.Index, block.Name, block.ID)
+					}
+				}
+
+			case "content_block_delta":
+				if streamEvt.Delta != nil {
+					var delta StreamTextDelta
+					if err := json.Unmarshal(streamEvt.Delta, &delta); err != nil {
+						continue
+					}
+					switch delta.Type {
+					case "text_delta":
+						if delta.Text != "" {
+							streamDeltaSent = true
+							fullText.WriteString(delta.Text)
+							safeText := filter.Feed(delta.Text)
+							if safeText != "" {
+								log.Printf("[BUFFERED STREAM DELTA] len=%d content=%q", len(safeText), truncate(safeText, 200))
+								chunk := ChatCompletionResponse{
+									ID:      chatID,
+									Object:  "chat.completion.chunk",
+									Created: created,
+									Model:   model,
+									Choices: []ChatCompletionChoice{
+										{
+											Index:        0,
+											Delta:        NewChatMessage("assistant", safeText),
+											FinishReason: nil,
+										},
+									},
+								}
+								data, _ := json.Marshal(chunk)
+								fmt.Fprintf(w, "data: %s\n\n", data)
+								flusher.Flush()
+							}
+						}
+					case "input_json_delta":
+						// Accumulate tool call arguments
+						if tc, ok := nativeTCs[streamEvt.Index]; ok {
+							tc.Args.WriteString(delta.PartialJSON)
+						}
+					}
+				}
+			}
+			continue
+		}
+
+		// Fallback: extract text from assistant events (when stream_event deltas are absent)
+		if !streamDeltaSent && event.Type == "assistant" {
+			text := extractTextFromEvent(&event)
+			if text != "" {
+				fullText.WriteString(text)
+				safeText := filter.Feed(text)
+				if safeText != "" {
+					log.Printf("[BUFFERED STREAM FALLBACK] len=%d content=%q", len(safeText), truncate(safeText, 200))
 					chunk := ChatCompletionResponse{
 						ID:      chatID,
 						Object:  "chat.completion.chunk",
@@ -919,7 +1081,7 @@ func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args [
 						Choices: []ChatCompletionChoice{
 							{
 								Index:        0,
-								Delta:        NewChatMessage("assistant", delta.Text),
+								Delta:        NewChatMessage("assistant", safeText),
 								FinishReason: nil,
 							},
 						},
@@ -929,39 +1091,11 @@ func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args [
 					flusher.Flush()
 				}
 			}
-			continue
 		}
 
-		// Fallback: extract text from assistant events (when stream_event deltas are absent)
-		if !streamDeltaSent {
-			text := extractTextFromEvent(&event)
-			if text != "" {
-				fullText.WriteString(text)
-				log.Printf("[BUFFERED STREAM FALLBACK] len=%d content=%q", len(text), truncate(text, 200))
-
-				chunk := ChatCompletionResponse{
-					ID:      chatID,
-					Object:  "chat.completion.chunk",
-					Created: created,
-					Model:   model,
-					Choices: []ChatCompletionChoice{
-						{
-							Index:        0,
-							Delta:        NewChatMessage("assistant", text),
-							FinishReason: nil,
-						},
-					},
-				}
-				data, _ := json.Marshal(chunk)
-				fmt.Fprintf(w, "data: %s\n\n", data)
-				flusher.Flush()
-			}
-		}
-
-		// Collect result text and usage from the final result event
+		// Collect usage from the final result event
 		if event.Type == "result" {
 			if event.Result != "" {
-				// Result may contain the final full text — use it for tool call detection
 				fullText.Reset()
 				fullText.WriteString(event.Result)
 			}
@@ -982,14 +1116,52 @@ func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args [
 		log.Printf("Claude command error: %v", waitErr)
 	}
 
-	// Now check full text for tool calls
-	collected := fullText.String()
-	_, toolCalls := parseToolCalls(collected)
+	// Flush any remaining buffered text from the filter
+	if remaining, _ := filter.Finish(); remaining != "" && !strings.HasPrefix(remaining, "<tool_call") {
+		chunk := ChatCompletionResponse{
+			ID:      chatID,
+			Object:  "chat.completion.chunk",
+			Created: created,
+			Model:   model,
+			Choices: []ChatCompletionChoice{
+				{
+					Index:        0,
+					Delta:        NewChatMessage("assistant", remaining),
+					FinishReason: nil,
+				},
+			},
+		}
+		data, _ := json.Marshal(chunk)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
+
+	// Build tool calls: prefer native tool_use, fall back to XML parsing
+	var toolCalls []ToolCall
+	for _, idx := range nativeTCOrder {
+		tc := nativeTCs[idx]
+		toolCalls = append(toolCalls, ToolCall{
+			ID:   tc.ID,
+			Type: "function",
+			Function: ToolCallFunction{
+				Name:      tc.Name,
+				Arguments: tc.Args.String(),
+			},
+		})
+	}
+	if len(toolCalls) > 0 {
+		log.Printf("Detected %d native tool_use calls", len(toolCalls))
+	} else {
+		// Fallback: check for <tool_call> XML in text
+		collected := fullText.String()
+		_, toolCalls = parseToolCalls(collected)
+		if len(toolCalls) > 0 {
+			log.Printf("Detected %d XML tool calls (fallback)", len(toolCalls))
+		}
+	}
 
 	if len(toolCalls) > 0 {
-		log.Printf("Detected %d tool calls in buffered output", len(toolCalls))
-
-		// Send tool calls
+		// Send tool calls in OpenAI format
 		for _, tc := range toolCalls {
 			chunk := ChatCompletionResponse{
 				ID:      chatID,
@@ -1060,7 +1232,7 @@ func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args [
 }
 
 func handleNonStreamResponse(w http.ResponseWriter, r *http.Request, args []string, prompt string, chatID string, created int64, model string, hasTools bool) {
-	_, lastText, result, usage, err := runClaude(args, prompt)
+	events, lastText, result, usage, err := runClaude(args, prompt)
 	if err != nil {
 		writeOAIError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
@@ -1082,30 +1254,41 @@ func handleNonStreamResponse(w http.ResponseWriter, r *http.Request, args []stri
 			model, usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens, cached)
 	}
 
-	if fullText == "" {
-		writeOAIError(w, http.StatusInternalServerError, "server_error", "Empty response from Claude")
-		return
-	}
-
 	var (
 		finishReason string
 		msg          *ChatMessage
 	)
 
 	if hasTools {
-		cleanText, toolCalls := parseToolCalls(fullText)
+		// Extract native tool_use from events
+		var toolCalls []ToolCall
+		toolCalls = extractNativeToolCalls(events)
 		if len(toolCalls) > 0 {
 			finishReason = "tool_calls"
-			msg = NewChatMessage("assistant", cleanText)
-			msg.ToolCalls = toolCalls
-			log.Printf("Non-stream: detected %d tool calls", len(toolCalls))
-		} else {
-			finishReason = "stop"
 			msg = NewChatMessage("assistant", fullText)
+			msg.ToolCalls = toolCalls
+			log.Printf("Non-stream: detected %d native tool_use calls", len(toolCalls))
+		} else {
+			// Fallback: parse <tool_call> XML from text
+			cleanText, xmlCalls := parseToolCalls(fullText)
+			if len(xmlCalls) > 0 {
+				finishReason = "tool_calls"
+				msg = NewChatMessage("assistant", cleanText)
+				msg.ToolCalls = xmlCalls
+				log.Printf("Non-stream: detected %d XML tool calls (fallback)", len(xmlCalls))
+			} else {
+				finishReason = "stop"
+				msg = NewChatMessage("assistant", fullText)
+			}
 		}
 	} else {
 		finishReason = "stop"
 		msg = NewChatMessage("assistant", fullText)
+	}
+
+	if msg == nil || (msg.ContentString() == "" && len(msg.ToolCalls) == 0) {
+		writeOAIError(w, http.StatusInternalServerError, "server_error", "Empty response from Claude")
+		return
 	}
 
 	resp := ChatCompletionResponse{
