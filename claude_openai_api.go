@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -53,6 +54,7 @@ type ChatMessage struct {
 	ToolCalls  []ToolCall      `json:"tool_calls,omitempty"`
 	ToolCallID string          `json:"tool_call_id,omitempty"`
 	Name       string          `json:"name,omitempty"`
+	Thinking   string          `json:"thinking,omitempty"`
 }
 
 type ToolCall struct {
@@ -167,9 +169,10 @@ type StreamContentBlock struct {
 }
 
 type StreamTextDelta struct {
-	Type        string `json:"type"` // text_delta, input_json_delta
+	Type        string `json:"type"` // text_delta, input_json_delta, thinking_delta
 	Text        string `json:"text,omitempty"`
 	PartialJSON string `json:"partial_json,omitempty"`
+	Thinking    string `json:"thinking,omitempty"`
 }
 
 // nativeToolCall tracks a tool_use content block from Claude CLI's stream output.
@@ -512,16 +515,90 @@ func (f *toolCallFilter) Finish() (remaining string, blocks []string) {
 
 // ---- Message conversion ----
 
+// extractAndSaveImages detects image_url content parts in a message, saves each
+// base64-encoded image to a temp file, and returns the file paths.
+func extractAndSaveImages(content json.RawMessage) []string {
+	if len(content) == 0 {
+		return nil
+	}
+	var parts []struct {
+		Type     string `json:"type"`
+		ImageURL *struct {
+			URL string `json:"url"`
+		} `json:"image_url,omitempty"`
+	}
+	if err := json.Unmarshal(content, &parts); err != nil {
+		return nil // not an array, no images
+	}
+	var paths []string
+	for _, p := range parts {
+		if p.Type != "image_url" || p.ImageURL == nil {
+			continue
+		}
+		url := p.ImageURL.URL
+		if !strings.HasPrefix(url, "data:") {
+			continue
+		}
+		comma := strings.Index(url, ",")
+		if comma < 0 {
+			continue
+		}
+		header := url[5:comma] // e.g. "image/png;base64"
+		b64Data := url[comma+1:]
+
+		ext := ".png"
+		if strings.Contains(header, "jpeg") || strings.Contains(header, "jpg") {
+			ext = ".jpg"
+		} else if strings.Contains(header, "gif") {
+			ext = ".gif"
+		} else if strings.Contains(header, "webp") {
+			ext = ".webp"
+		}
+
+		imgBytes, err := base64.StdEncoding.DecodeString(b64Data)
+		if err != nil {
+			log.Printf("Failed to decode image base64: %v", err)
+			continue
+		}
+
+		var randBytes [8]byte
+		if _, err := rand.Read(randBytes[:]); err != nil {
+			continue
+		}
+		tmpPath := fmt.Sprintf("/tmp/claude-img-%s%s", hex.EncodeToString(randBytes[:]), ext)
+		if err := os.WriteFile(tmpPath, imgBytes, 0600); err != nil {
+			log.Printf("Failed to write temp image %s: %v", tmpPath, err)
+			continue
+		}
+		log.Printf("Saved attached image to: %s", tmpPath)
+		paths = append(paths, tmpPath)
+	}
+	return paths
+}
+
 // buildPromptFromMessages converts OpenAI-style messages into a single prompt string
 // and extracts the system prompt separately.
-func buildPromptFromMessages(messages []ChatMessage) (prompt string, systemPrompt string) {
+func buildPromptFromMessages(messages []ChatMessage) (prompt string, systemPrompt string, tempFiles []string) {
 	var parts []string
 	for _, msg := range messages {
 		switch msg.Role {
 		case "system":
 			systemPrompt = msg.ContentString()
 		case "user":
-			parts = append(parts, fmt.Sprintf("Human: %s", msg.ContentString()))
+			text := msg.ContentString()
+			imgPaths := extractAndSaveImages(msg.Content)
+			tempFiles = append(tempFiles, imgPaths...)
+			if len(imgPaths) > 0 {
+				var refs []string
+				for _, p := range imgPaths {
+					refs = append(refs, fmt.Sprintf("[Image: %s]", p))
+				}
+				if text != "" {
+					text += "\n"
+				}
+				text += strings.Join(refs, "\n")
+			}
+			parts = append(parts, fmt.Sprintf("Human: %s", text))
 		case "assistant":
 			text := msg.ContentString()
 			// Reconstruct tool calls as <tool_call> blocks so Claude sees the history
@@ -622,7 +699,14 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	if model == "" {
 		model = defaultModel
 	}
-	prompt, systemPrompt := buildPromptFromMessages(req.Messages)
+	prompt, systemPrompt, tempFiles := buildPromptFromMessages(req.Messages)
+	if len(tempFiles) > 0 {
+		defer func() {
+			for _, f := range tempFiles {
+				os.Remove(f)
+			}
+		}()
+	}
 
 	// Inject tool definitions into system prompt
 	hasTools := len(req.Tools) > 0
@@ -651,7 +735,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	// Always limit to 1 turn — our proxy is stateless and tool execution
 	// is managed by the caller (OpenClaw). Prevents Claude from using its
 	// own built-in tools (Bash, Read, Write, etc.) which leak as text.
-	args = append(args, "--max-turns", "1")
+	args = append(args, "--max-turns", "0")
 
 	log.Printf("Claude args: %v (prompt length: %d bytes via stdin)", args, len(prompt))
 
@@ -792,6 +876,7 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 	flusher.Flush()
 
 	var streamDeltaSent bool // true if we've sent any stream_event deltas
+	seenToolNames := map[string]bool{} // deduplicate tool_call chunks across both detection paths
 
 	scanner := bufio.NewScanner(stdout)
 	const maxCapacity = 1024 * 1024
@@ -817,6 +902,38 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 			var streamEvt StreamAPIEvent
 			if err := json.Unmarshal(event.Event, &streamEvt); err != nil {
 				continue
+			}
+			// Emit tool_calls delta immediately when Claude starts a tool_use block
+			if streamEvt.Type == "content_block_start" && streamEvt.ContentBlock != nil {
+				var block StreamContentBlock
+				if err := json.Unmarshal(streamEvt.ContentBlock, &block); err == nil && block.Type == "tool_use" && block.Name != "" {
+					log.Printf("[STREAM TOOL_USE] name=%s id=%s", block.Name, block.ID)
+					seenToolNames[block.Name] = true
+					tc := ToolCall{
+						ID:   block.ID,
+						Type: "function",
+						Function: ToolCallFunction{Name: block.Name, Arguments: ""},
+					}
+					chunk := ChatCompletionResponse{
+						ID:      chatID,
+						Object:  "chat.completion.chunk",
+						Created: created,
+						Model:   model,
+						Choices: []ChatCompletionChoice{
+							{
+								Index: 0,
+								Delta: &ChatMessage{
+									Role:      "assistant",
+									ToolCalls: []ToolCall{tc},
+								},
+							},
+						},
+					}
+					data, _ := json.Marshal(chunk)
+					log.Printf("[SSE TOOL_USE] data=%s", data)
+					fmt.Fprintf(w, "data: %s\n\n", data)
+					flusher.Flush()
+				}
 			}
 			if streamEvt.Type == "content_block_delta" && streamEvt.Delta != nil {
 				var delta StreamTextDelta
@@ -844,8 +961,66 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 					fmt.Fprintf(w, "data: %s\n\n", data)
 					flusher.Flush()
 				}
+				if delta.Type == "thinking_delta" && delta.Thinking != "" {
+					log.Printf("[STREAM THINKING] len=%d", len(delta.Thinking))
+					chunk := ChatCompletionResponse{
+						ID:      chatID,
+						Object:  "chat.completion.chunk",
+						Created: created,
+						Model:   model,
+						Choices: []ChatCompletionChoice{
+							{
+								Index:        0,
+								Delta:        &ChatMessage{Role: "assistant", Thinking: delta.Thinking},
+								FinishReason: nil,
+							},
+						},
+					}
+					data, _ := json.Marshal(chunk)
+					fmt.Fprintf(w, "data: %s\n\n", data)
+					log.Printf("[SSE THINKING] data=%s", data)
+					flusher.Flush()
+				}
 			}
 			continue
+		}
+
+		// Fallback: extract tool_use and text from assistant summary events.
+		// Handles the case where content_block_start stream events were absent
+		// (e.g., claude CLI emits a complete assistant message instead of streaming).
+		if event.Type == "assistant" && event.Message != nil {
+			var msg ClaudeMessage
+			if err := json.Unmarshal(event.Message, &msg); err == nil {
+				for _, c := range msg.Content {
+					if c.Type == "tool_use" && c.Name != "" && !seenToolNames[c.Name] {
+						seenToolNames[c.Name] = true
+						log.Printf("[ASSISTANT TOOL_USE FALLBACK] name=%s", c.Name)
+						tc := ToolCall{
+							ID:   c.Name, // no ID in ClaudeContent; use name as stable key
+							Type: "function",
+							Function: ToolCallFunction{Name: c.Name, Arguments: ""},
+						}
+						chunk := ChatCompletionResponse{
+							ID:      chatID,
+							Object:  "chat.completion.chunk",
+							Created: created,
+							Model:   model,
+							Choices: []ChatCompletionChoice{
+								{
+									Index: 0,
+									Delta: &ChatMessage{
+										Role:      "assistant",
+										ToolCalls: []ToolCall{tc},
+									},
+								},
+							},
+						}
+						data, _ := json.Marshal(chunk)
+						fmt.Fprintf(w, "data: %s\n\n", data)
+						flusher.Flush()
+					}
+				}
+			}
 		}
 
 		// Fallback: extract text from assistant events (when stream_event deltas are absent)
