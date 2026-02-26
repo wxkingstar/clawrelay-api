@@ -31,6 +31,7 @@ type ChatCompletionRequest struct {
 	Stop          json.RawMessage `json:"stop,omitempty"`
 	Tools         []Tool          `json:"tools,omitempty"`
 	ToolChoice    json.RawMessage `json:"tool_choice,omitempty"`
+	WorkingDir    string          `json:"working_dir,omitempty"`
 }
 
 type StreamOptions struct {
@@ -741,15 +742,17 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 
 	includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
 
+	workingDir := req.WorkingDir
+
 	if req.Stream {
 		if hasTools {
 			// Buffer output to properly detect and format tool calls
-			handleBufferedStreamResponse(w, r, args, prompt, chatID, created, model, includeUsage)
+			handleBufferedStreamResponse(w, r, args, prompt, chatID, created, model, includeUsage, workingDir)
 		} else {
-			handleStreamResponse(w, r, args, prompt, chatID, created, model, includeUsage)
+			handleStreamResponse(w, r, args, prompt, chatID, created, model, includeUsage, workingDir)
 		}
 	} else {
-		handleNonStreamResponse(w, r, args, prompt, chatID, created, model, hasTools)
+		handleNonStreamResponse(w, r, args, prompt, chatID, created, model, hasTools, workingDir)
 	}
 }
 
@@ -766,9 +769,12 @@ func cleanEnv() []string {
 }
 
 // runClaude starts a claude process and collects its output events.
-func runClaude(args []string, prompt string) (events []ClaudeEvent, lastText string, result string, usage *UsageInfo, err error) {
+func runClaude(args []string, prompt string, workingDir string) (events []ClaudeEvent, lastText string, result string, usage *UsageInfo, err error) {
 	cmd := exec.Command("claude", args...)
 	cmd.Env = cleanEnv()
+	if workingDir != "" {
+		cmd.Dir = workingDir
+	}
 	cmd.Stdin = strings.NewReader(prompt)
 
 	stdout, err := cmd.StdoutPipe()
@@ -833,9 +839,12 @@ func runClaude(args []string, prompt string) (events []ClaudeEvent, lastText str
 }
 
 // handleStreamResponse streams text output without tool call detection (fast path).
-func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string, prompt string, chatID string, created int64, model string, includeUsage bool) {
+func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string, prompt string, chatID string, created int64, model string, includeUsage bool, workingDir string) {
 	cmd := exec.Command("claude", args...)
 	cmd.Env = cleanEnv()
+	if workingDir != "" {
+		cmd.Dir = workingDir
+	}
 	cmd.Stdin = strings.NewReader(prompt)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -1105,9 +1114,12 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 // handleBufferedStreamResponse streams text deltas in real-time while also
 // collecting full text to detect tool calls at the end.
 // Used when tools are defined in the request.
-func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args []string, prompt string, chatID string, created int64, model string, includeUsage bool) {
+func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args []string, prompt string, chatID string, created int64, model string, includeUsage bool, workingDir string) {
 	cmd := exec.Command("claude", args...)
 	cmd.Env = cleanEnv()
+	if workingDir != "" {
+		cmd.Dir = workingDir
+	}
 	cmd.Stdin = strings.NewReader(prompt)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -1406,8 +1418,8 @@ func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args [
 	flusher.Flush()
 }
 
-func handleNonStreamResponse(w http.ResponseWriter, r *http.Request, args []string, prompt string, chatID string, created int64, model string, hasTools bool) {
-	events, lastText, result, usage, err := runClaude(args, prompt)
+func handleNonStreamResponse(w http.ResponseWriter, r *http.Request, args []string, prompt string, chatID string, created int64, model string, hasTools bool, workingDir string) {
+	events, lastText, result, usage, err := runClaude(args, prompt, workingDir)
 	if err != nil {
 		writeOAIError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
