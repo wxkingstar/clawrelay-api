@@ -1,8 +1,9 @@
 package main
 
 import (
+	_ "embed"
 	"encoding/json"
-	"fmt"
+	"html/template"
 	"log"
 	"net/http"
 	"os"
@@ -13,6 +14,10 @@ import (
 
 	"github.com/gorilla/websocket"
 )
+
+//go:embed session_viewer.html
+var sessionViewerHTML string
+var sessionViewerTmpl = template.Must(template.New("session").Parse(sessionViewerHTML))
 
 // SessionEvent represents a single event in a session's conversation history.
 type SessionEvent struct {
@@ -177,7 +182,7 @@ func sessionLogDelta(sessionID string, text string) {
 	})
 }
 
-func sessionLogToolUse(sessionID string, name string, id string) {
+func sessionLogToolUse(sessionID string, name string, id string, input string) {
 	if sessionID == "" {
 		return
 	}
@@ -185,7 +190,7 @@ func sessionLogToolUse(sessionID string, name string, id string) {
 	if entry == nil {
 		return
 	}
-	data, _ := json.Marshal(map[string]string{"tool": name, "id": id})
+	data, _ := json.Marshal(map[string]string{"tool": name, "id": id, "input": input})
 	entry.Append(SessionEvent{
 		Timestamp: time.Now().Format(time.RFC3339Nano),
 		Type:      "tool_use",
@@ -223,6 +228,80 @@ func sessionLogError(sessionID string, errMsg string) {
 		Type:      "error",
 		Data:      data,
 	})
+}
+
+// startSessionCleanup runs a background goroutine that periodically removes
+// sessions (log files, attachment directories, and in-memory state) older than maxAge.
+func (s *sessionStore) startSessionCleanup(maxAge time.Duration, interval time.Duration) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			s.cleanupOldSessions(maxAge)
+		}
+	}()
+}
+
+func (s *sessionStore) cleanupOldSessions(maxAge time.Duration) {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-maxAge)
+	for _, e := range entries {
+		name := e.Name()
+		// Handle both session log files (.jsonl) and session directories
+		var sessionID string
+		var modTime time.Time
+
+		if e.IsDir() {
+			// Session attachment directory — check mod time
+			sessionID = name
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			modTime = info.ModTime()
+		} else if strings.HasSuffix(name, ".jsonl") {
+			sessionID = strings.TrimSuffix(name, ".jsonl")
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			modTime = info.ModTime()
+		} else {
+			continue
+		}
+
+		if modTime.After(cutoff) {
+			continue
+		}
+
+		// Remove log file
+		logPath := filepath.Join(s.dir, sessionID+".jsonl")
+		if err := os.Remove(logPath); err != nil && !os.IsNotExist(err) {
+			log.Printf("session cleanup: failed to remove %s: %v", logPath, err)
+		}
+		// Remove attachment directory
+		filesDir := filepath.Join(s.dir, sessionID)
+		if err := os.RemoveAll(filesDir); err != nil {
+			log.Printf("session cleanup: failed to remove %s: %v", filesDir, err)
+		}
+
+		// Remove from in-memory store
+		s.mu.Lock()
+		if entry, ok := s.sessions[sessionID]; ok {
+			entry.mu.Lock()
+			if entry.logFile != nil {
+				entry.logFile.Close()
+			}
+			entry.mu.Unlock()
+			delete(s.sessions, sessionID)
+		}
+		s.mu.Unlock()
+
+		log.Printf("session cleanup: removed expired session %s (last modified: %s)", sessionID, modTime.Format(time.RFC3339))
+	}
 }
 
 // ---- WebSocket + HTML handlers ----
@@ -305,7 +384,7 @@ func sessionPageHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, sessionViewerHTML, sessionID, sessionID)
+	sessionViewerTmpl.Execute(w, struct{ SessionID string }{sessionID})
 }
 
 // sessionListHandler serves a JSON list of all session IDs
@@ -332,162 +411,3 @@ func sessionListHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(sessions)
 }
 
-const sessionViewerHTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Session: %s</title>
-<style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace; background: #0d1117; color: #c9d1d9; }
-  .header { background: #161b22; border-bottom: 1px solid #30363d; padding: 12px 20px; display: flex; align-items: center; gap: 12px; position: sticky; top: 0; z-index: 10; }
-  .header h1 { font-size: 16px; color: #58a6ff; }
-  .status { font-size: 12px; padding: 3px 8px; border-radius: 12px; }
-  .status.connected { background: #238636; color: #fff; }
-  .status.disconnected { background: #da3633; color: #fff; }
-  .container { max-width: 960px; margin: 0 auto; padding: 20px; }
-  .event { margin-bottom: 8px; border-left: 3px solid #30363d; padding: 8px 12px; background: #161b22; border-radius: 0 6px 6px 0; }
-  .event.request { border-left-color: #58a6ff; }
-  .event.response_delta { border-left-color: #3fb950; }
-  .event.response_done { border-left-color: #8b949e; }
-  .event.tool_use { border-left-color: #d29922; }
-  .event.error { border-left-color: #da3633; }
-  .event-header { font-size: 11px; color: #8b949e; margin-bottom: 4px; display: flex; gap: 8px; }
-  .event-type { font-weight: bold; text-transform: uppercase; }
-  .event-type.request { color: #58a6ff; }
-  .event-type.response_delta { color: #3fb950; }
-  .event-type.tool_use { color: #d29922; }
-  .event-type.error { color: #da3633; }
-  .event-content { font-size: 13px; white-space: pre-wrap; word-break: break-word; line-height: 1.5; }
-  .streaming-block { margin-bottom: 8px; border-left: 3px solid #3fb950; padding: 8px 12px; background: #161b22; border-radius: 0 6px 6px 0; }
-  .streaming-block .event-header { font-size: 11px; color: #8b949e; margin-bottom: 4px; }
-  .streaming-content { font-size: 13px; white-space: pre-wrap; word-break: break-word; line-height: 1.5; }
-  .cursor { display: inline-block; width: 8px; height: 14px; background: #3fb950; animation: blink 1s infinite; vertical-align: text-bottom; }
-  @keyframes blink { 0%%,50%% { opacity: 1; } 51%%,100%% { opacity: 0; } }
-  .request-summary { color: #8b949e; }
-  .request-summary .model { color: #d2a8ff; }
-  .request-summary .msg-count { color: #58a6ff; }
-</style>
-</head>
-<body>
-<div class="header">
-  <h1>Session: %s</h1>
-  <span class="status disconnected" id="status">Connecting...</span>
-</div>
-<div class="container" id="events"></div>
-<script>
-const sessionId = location.pathname.split('/').filter(Boolean)[1];
-const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-const wsUrl = wsProto + '//' + location.host + '/session/' + sessionId + '/ws';
-const eventsEl = document.getElementById('events');
-const statusEl = document.getElementById('status');
-let streamingEl = null;
-let streamingContent = '';
-
-function connect() {
-  const ws = new WebSocket(wsUrl);
-  ws.onopen = () => {
-    statusEl.textContent = 'Connected';
-    statusEl.className = 'status connected';
-  };
-  ws.onclose = () => {
-    statusEl.textContent = 'Disconnected';
-    statusEl.className = 'status disconnected';
-    setTimeout(connect, 3000);
-  };
-  ws.onmessage = (e) => {
-    const ev = JSON.parse(e.data);
-    if (ev.type === 'history_end') return;
-    renderEvent(ev);
-  };
-}
-
-function renderEvent(ev) {
-  const data = typeof ev.data === 'string' ? JSON.parse(ev.data) : ev.data;
-
-  if (ev.type === 'response_delta') {
-    if (!streamingEl) {
-      streamingEl = document.createElement('div');
-      streamingEl.className = 'streaming-block';
-      streamingEl.innerHTML = '<div class="event-header"><span class="event-type response_delta">ASSISTANT</span></div><div class="streaming-content"></div>';
-      eventsEl.appendChild(streamingEl);
-      streamingContent = '';
-    }
-    streamingContent += (data.text || '');
-    const contentEl = streamingEl.querySelector('.streaming-content');
-    contentEl.textContent = streamingContent;
-    // Add cursor
-    let cursor = streamingEl.querySelector('.cursor');
-    if (!cursor) { cursor = document.createElement('span'); cursor.className = 'cursor'; contentEl.appendChild(cursor); }
-    autoScroll();
-    return;
-  }
-
-  // Finalize streaming block
-  if (streamingEl && (ev.type === 'response_done' || ev.type === 'request' || ev.type === 'tool_use')) {
-    const cursor = streamingEl.querySelector('.cursor');
-    if (cursor) cursor.remove();
-    streamingEl = null;
-    streamingContent = '';
-  }
-
-  const div = document.createElement('div');
-  div.className = 'event ' + (ev.type || '');
-
-  const ts = ev.timestamp ? new Date(ev.timestamp).toLocaleTimeString() : '';
-  let content = '';
-
-  switch(ev.type) {
-    case 'request':
-      const model = data.model || '?';
-      const msgCount = (data.messages || []).length;
-      const lastMsg = (data.messages || []).slice(-1)[0];
-      let preview = '';
-      if (lastMsg) {
-        try {
-          let c = lastMsg.content;
-          if (typeof c === 'string') { preview = c; }
-          else if (Array.isArray(c)) { preview = c.map(p => p.text || '').join(''); }
-          else { preview = JSON.stringify(c); }
-        } catch(e) { preview = JSON.stringify(lastMsg.content); }
-      }
-      if (preview.length > 300) preview = preview.substring(0, 300) + '...';
-      content = '<span class="request-summary">Model: <span class="model">' + escHtml(model) + '</span> | Messages: <span class="msg-count">' + msgCount + '</span></span>\n' + escHtml(preview);
-      break;
-    case 'tool_use':
-      content = 'Tool: ' + escHtml(data.tool || '') + ' (id: ' + escHtml(data.id || '') + ')';
-      break;
-    case 'response_done':
-      const u = data.usage;
-      content = u ? 'Tokens - prompt: ' + (u.prompt_tokens||0) + ', completion: ' + (u.completion_tokens||0) + ', total: ' + (u.total_tokens||0) : 'Done';
-      break;
-    case 'error':
-      content = escHtml(data.error || JSON.stringify(data));
-      break;
-    default:
-      content = JSON.stringify(data, null, 2);
-  }
-
-  div.innerHTML = '<div class="event-header"><span class="event-type ' + (ev.type||'') + '">' + (ev.type||'').toUpperCase() + '</span><span>' + ts + '</span></div><div class="event-content">' + content + '</div>';
-  eventsEl.appendChild(div);
-  autoScroll();
-}
-
-function escHtml(s) {
-  const d = document.createElement('div');
-  d.textContent = s;
-  return d.innerHTML;
-}
-
-function autoScroll() {
-  if (window.innerHeight + window.scrollY >= document.body.scrollHeight - 100) {
-    window.scrollTo(0, document.body.scrollHeight);
-  }
-}
-
-connect();
-</script>
-</body>
-</html>
-`

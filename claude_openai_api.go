@@ -3,15 +3,18 @@ package main
 import (
 	"bufio"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -123,7 +126,8 @@ type ChatCompletionChoice struct {
 }
 
 type PromptTokensDetails struct {
-	CachedTokens int `json:"cached_tokens"`
+	CachedTokens        int `json:"cached_tokens"`
+	CacheCreationTokens int `json:"cache_creation_tokens,omitempty"`
 }
 
 type UsageInfo struct {
@@ -148,12 +152,13 @@ type ModelInfo struct {
 // ---- Claude stream-json event types ----
 
 type ClaudeEvent struct {
-	Type    string          `json:"type"`
-	Subtype string          `json:"subtype,omitempty"`
-	Message json.RawMessage `json:"message,omitempty"`
-	Event   json.RawMessage `json:"event,omitempty"` // for stream_event wrapper
-	Result  string          `json:"result,omitempty"`
-	Usage   *ClaudeUsage    `json:"usage,omitempty"`
+	Type         string          `json:"type"`
+	Subtype      string          `json:"subtype,omitempty"`
+	Message      json.RawMessage `json:"message,omitempty"`
+	Event        json.RawMessage `json:"event,omitempty"` // for stream_event wrapper
+	Result       string          `json:"result,omitempty"`
+	Usage        *ClaudeUsage    `json:"usage,omitempty"`
+	TotalCostUSD float64         `json:"total_cost_usd,omitempty"`
 }
 
 // StreamAPIEvent represents the inner event of a stream_event wrapper,
@@ -207,29 +212,38 @@ type ClaudeUsage struct {
 // ---- Token statistics ----
 
 type ModelTokenStats struct {
-	Requests int64 `json:"requests"`
-	Input    int64 `json:"input_tokens"`
-	Output   int64 `json:"output_tokens"`
-	Total    int64 `json:"total_tokens"`
+	Requests     int64   `json:"requests"`
+	Input        int64   `json:"input_tokens"`
+	Output       int64   `json:"output_tokens"`
+	CacheCreation int64  `json:"cache_creation_input_tokens"`
+	CacheRead    int64   `json:"cache_read_input_tokens"`
+	Total        int64   `json:"total_tokens"`
+	CostUSD      float64 `json:"cost_usd"`
 }
 
 type TokenStatsSnapshot struct {
 	TotalRequests int64                       `json:"total_requests"`
 	InputTokens   int64                       `json:"input_tokens"`
 	OutputTokens  int64                       `json:"output_tokens"`
+	CacheCreation int64                       `json:"cache_creation_input_tokens"`
+	CacheRead     int64                       `json:"cache_read_input_tokens"`
 	TotalTokens   int64                       `json:"total_tokens"`
+	CostUSD       float64                     `json:"cost_usd"`
 	PerModel      map[string]*ModelTokenStats `json:"per_model"`
 	StartTime     string                      `json:"start_time"`
 	Uptime        string                      `json:"uptime"`
 }
 
 type tokenStats struct {
-	mu        sync.Mutex
-	requests  int64
-	input     int64
-	output    int64
-	perModel  map[string]*ModelTokenStats
-	startTime time.Time
+	mu            sync.Mutex
+	requests      int64
+	input         int64
+	output        int64
+	cacheCreation int64
+	cacheRead     int64
+	costUSD       float64
+	perModel      map[string]*ModelTokenStats
+	startTime     time.Time
 }
 
 var globalStats = &tokenStats{
@@ -237,12 +251,15 @@ var globalStats = &tokenStats{
 	startTime: time.Now(),
 }
 
-func (s *tokenStats) Record(model string, input, output int) {
+func (s *tokenStats) Record(model string, input, output, cacheCreation, cacheRead int, costUSD float64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.requests++
 	s.input += int64(input)
 	s.output += int64(output)
+	s.cacheCreation += int64(cacheCreation)
+	s.cacheRead += int64(cacheRead)
+	s.costUSD += costUSD
 
 	ms, ok := s.perModel[model]
 	if !ok {
@@ -252,7 +269,10 @@ func (s *tokenStats) Record(model string, input, output int) {
 	ms.Requests++
 	ms.Input += int64(input)
 	ms.Output += int64(output)
-	ms.Total += int64(input + output)
+	ms.CacheCreation += int64(cacheCreation)
+	ms.CacheRead += int64(cacheRead)
+	ms.Total += int64(input + output + cacheCreation + cacheRead)
+	ms.CostUSD += costUSD
 }
 
 func (s *tokenStats) Snapshot() TokenStatsSnapshot {
@@ -267,7 +287,10 @@ func (s *tokenStats) Snapshot() TokenStatsSnapshot {
 		TotalRequests: s.requests,
 		InputTokens:   s.input,
 		OutputTokens:  s.output,
-		TotalTokens:   s.input + s.output,
+		CacheCreation: s.cacheCreation,
+		CacheRead:     s.cacheRead,
+		TotalTokens:   s.input + s.output + s.cacheCreation + s.cacheRead,
+		CostUSD:       s.costUSD,
 		PerModel:      pm,
 		StartTime:     s.startTime.Format(time.RFC3339),
 		Uptime:        time.Since(s.startTime).Truncate(time.Second).String(),
@@ -287,9 +310,10 @@ func buildUsageInfo(cu *ClaudeUsage) *UsageInfo {
 		CompletionTokens: cu.OutputTokens,
 		TotalTokens:      promptTokens + cu.OutputTokens,
 	}
-	if cu.CacheReadInputTokens > 0 {
+	if cu.CacheReadInputTokens > 0 || cu.CacheCreationInputTokens > 0 {
 		u.PromptTokensDetails = &PromptTokensDetails{
-			CachedTokens: cu.CacheReadInputTokens,
+			CachedTokens:        cu.CacheReadInputTokens,
+			CacheCreationTokens: cu.CacheCreationInputTokens,
 		}
 	}
 	return u
@@ -589,8 +613,10 @@ type savedFile struct {
 }
 
 // extractAndSaveAttachments detects image_url and file_url content parts,
-// saves each base64-encoded payload to a temp file, and returns metadata.
-func extractAndSaveAttachments(content json.RawMessage) []savedFile {
+// saves each base64-encoded payload to a file, and returns metadata.
+// If sessionDir is non-empty, files are saved there (session-scoped) and
+// content-hashed to avoid duplicate writes; otherwise they go to /tmp.
+func extractAndSaveAttachments(content json.RawMessage, sessionDir string) []savedFile {
 	if len(content) == 0 {
 		return nil
 	}
@@ -606,6 +632,11 @@ func extractAndSaveAttachments(content json.RawMessage) []savedFile {
 	}
 	if err := json.Unmarshal(content, &parts); err != nil {
 		return nil
+	}
+
+	// Ensure session directory exists once (not per-attachment).
+	if sessionDir != "" {
+		os.MkdirAll(sessionDir, 0755)
 	}
 
 	var files []savedFile
@@ -645,30 +676,53 @@ func extractAndSaveAttachments(content json.RawMessage) []savedFile {
 			}
 		}
 
+		dir := "/tmp"
+		if sessionDir != "" {
+			dir = sessionDir
+		}
+
+		// For session-scoped storage, use a hash of the base64 string as
+		// filename to deduplicate. We hash the raw b64 text (cheap) to
+		// check existence *before* doing the expensive base64 decode.
+		var filePath string
+		if sessionDir != "" {
+			hash := sha256.Sum256([]byte(b64Data))
+			name := fmt.Sprintf("%s-%s%s", prefix, hex.EncodeToString(hash[:8]), ext)
+			filePath = filepath.Join(dir, name)
+			if _, err := os.Stat(filePath); err == nil {
+				// File already exists — skip decode and write entirely.
+				files = append(files, savedFile{path: filePath, isImage: isImage})
+				continue
+			}
+		} else {
+			var randBytes [8]byte
+			if _, err := rand.Read(randBytes[:]); err != nil {
+				continue
+			}
+			filePath = filepath.Join(dir, fmt.Sprintf("%s-%s%s", prefix, hex.EncodeToString(randBytes[:]), ext))
+		}
+
 		fileBytes, err := base64.StdEncoding.DecodeString(b64Data)
 		if err != nil {
 			log.Printf("Failed to decode attachment base64: %v", err)
 			continue
 		}
 
-		var randBytes [8]byte
-		if _, err := rand.Read(randBytes[:]); err != nil {
+		if err := os.WriteFile(filePath, fileBytes, 0600); err != nil {
+			log.Printf("Failed to write file %s: %v", filePath, err)
 			continue
 		}
-		tmpPath := fmt.Sprintf("/tmp/%s-%s%s", prefix, hex.EncodeToString(randBytes[:]), ext)
-		if err := os.WriteFile(tmpPath, fileBytes, 0600); err != nil {
-			log.Printf("Failed to write temp file %s: %v", tmpPath, err)
-			continue
-		}
-		log.Printf("Saved attachment to: %s", tmpPath)
-		files = append(files, savedFile{path: tmpPath, isImage: isImage})
+		log.Printf("Saved attachment to: %s", filePath)
+		files = append(files, savedFile{path: filePath, isImage: isImage})
 	}
 	return files
 }
 
 // buildPromptFromMessages converts OpenAI-style messages into a single prompt string
 // and extracts the system prompt separately.
-func buildPromptFromMessages(messages []ChatMessage) (prompt string, systemPrompt string, tempFiles []string) {
+// If sessionDir is non-empty, attachments are saved there (session-scoped) and
+// tempFiles will be nil (caller should not clean up per-request).
+func buildPromptFromMessages(messages []ChatMessage, sessionDir string) (prompt string, systemPrompt string, tempFiles []string) {
 	var parts []string
 	for _, msg := range messages {
 		switch msg.Role {
@@ -676,9 +730,12 @@ func buildPromptFromMessages(messages []ChatMessage) (prompt string, systemPromp
 			systemPrompt = msg.ContentString()
 		case "user":
 			text := msg.ContentString()
-			attachments := extractAndSaveAttachments(msg.Content)
+			attachments := extractAndSaveAttachments(msg.Content, sessionDir)
 			for _, a := range attachments {
-				tempFiles = append(tempFiles, a.path)
+				if sessionDir == "" {
+					// Only track for cleanup when not session-scoped
+					tempFiles = append(tempFiles, a.path)
+				}
 			}
 			if len(attachments) > 0 {
 				var refs []string
@@ -779,7 +836,11 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		writeOAIError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("Failed to read body: %v", err))
 		return
 	}
-	log.Printf("Raw request body (%d bytes): %s", len(bodyBytes), string(bodyBytes))
+	if len(bodyBytes) <= 4096 {
+		log.Printf("Raw request body (%d bytes): %s", len(bodyBytes), string(bodyBytes))
+	} else {
+		log.Printf("Raw request body (%d bytes): %s...[truncated]", len(bodyBytes), string(bodyBytes[:4096]))
+	}
 
 	var req ChatCompletionRequest
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
@@ -795,7 +856,19 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	if model == "" {
 		model = defaultModel
 	}
-	prompt, systemPrompt, tempFiles := buildPromptFromMessages(req.Messages)
+	// If session_id is provided, save attachments to session-scoped directory
+	// so they persist across follow-up messages.
+	var sessionDir string
+	if req.SessionID != "" {
+		dir := globalSessionStore.dir
+		if !filepath.IsAbs(dir) {
+			if abs, err := filepath.Abs(dir); err == nil {
+				dir = abs
+			}
+		}
+		sessionDir = filepath.Join(dir, req.SessionID, "files")
+	}
+	prompt, systemPrompt, tempFiles := buildPromptFromMessages(req.Messages, sessionDir)
 	if len(tempFiles) > 0 {
 		defer func() {
 			for _, f := range tempFiles {
@@ -820,7 +893,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	// Build claude CLI args
 	args := []string{}
 	if systemPrompt != "" {
-		args = append(args, "--system-prompt", systemPrompt)
+		args = append(args, "--append-system-prompt", systemPrompt)
 	}
 	args = append(args, "--model", model)
 	//args = append(args, "--betas", "context-1m-2025-08-07")
@@ -1072,7 +1145,7 @@ func startClaudeStream(args []string, prompt string, workingDir string, envVars 
 }
 
 // runClaude starts a claude process and collects its output events.
-func runClaude(args []string, prompt string, workingDir string, envVars map[string]string) (events []ClaudeEvent, lastText string, result string, usage *UsageInfo, err error) {
+func runClaude(args []string, prompt string, workingDir string, envVars map[string]string) (events []ClaudeEvent, lastText string, result string, usage *UsageInfo, rawUsage *ClaudeUsage, costUSD float64, err error) {
 	_, lines, sessErrCh, err := launchClaude(args, prompt, workingDir, envVars)
 	if err != nil {
 		return
@@ -1100,6 +1173,8 @@ func runClaude(args []string, prompt string, workingDir string, envVars map[stri
 			}
 			if event.Usage != nil {
 				usage = buildUsageInfo(event.Usage)
+				rawUsage = event.Usage
+				costUSD = event.TotalCostUSD
 			}
 		}
 	}
@@ -1148,6 +1223,7 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 	flusher.Flush()
 
 	var streamDeltaSent bool // true if we've sent any stream_event deltas
+	var streamUsage *UsageInfo // captured from result event for session logging
 	seenToolNames := map[string]bool{} // deduplicate tool_call chunks across both detection paths
 
 	// AskUserQuestion tracking
@@ -1183,6 +1259,14 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 		aggCount++
 	}
 
+	// Track tool_use blocks for session logging with input
+	type toolBlock struct {
+		Name string
+		ID   string
+		Args strings.Builder
+	}
+	toolBlocks := map[int]*toolBlock{}
+
 	for line := range lines {
 		if line == "" {
 			continue
@@ -1206,7 +1290,7 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 				if err := json.Unmarshal(streamEvt.ContentBlock, &block); err == nil && block.Type == "tool_use" && block.Name != "" {
 					flushAggLog()
 					log.Printf("[STREAM TOOL_USE] name=%s id=%s", block.Name, block.ID)
-					sessionLogToolUse(sessionID, block.Name, block.ID)
+					toolBlocks[streamEvt.Index] = &toolBlock{Name: block.Name, ID: block.ID}
 					if block.Name == "AskUserQuestion" {
 						askUserIdx = streamEvt.Index
 						askUserID = block.ID
@@ -1286,8 +1370,20 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 					fmt.Fprintf(w, "data: %s\n\n", data)
 					flusher.Flush()
 				}
-				if delta.Type == "input_json_delta" && askUserIdx >= 0 && streamEvt.Index == askUserIdx {
-					askUserArgs.WriteString(delta.PartialJSON)
+				if delta.Type == "input_json_delta" {
+					if tb, ok := toolBlocks[streamEvt.Index]; ok {
+						tb.Args.WriteString(delta.PartialJSON)
+					}
+					if askUserIdx >= 0 && streamEvt.Index == askUserIdx {
+						askUserArgs.WriteString(delta.PartialJSON)
+					}
+				}
+			}
+			// Log tool_use with input at content_block_stop
+			if streamEvt.Type == "content_block_stop" {
+				if tb, ok := toolBlocks[streamEvt.Index]; ok {
+					sessionLogToolUse(sessionID, tb.Name, tb.ID, tb.Args.String())
+					delete(toolBlocks, streamEvt.Index)
 				}
 			}
 			// Handle content_block_stop for AskUserQuestion
@@ -1419,10 +1515,12 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 
 		if event.Type == "result" {
 			if event.Usage != nil {
-				globalStats.Record(model, event.Usage.InputTokens, event.Usage.OutputTokens)
-				log.Printf("Token usage: model=%s input=%d output=%d cache_read=%d cache_create=%d",
+				globalStats.Record(model, event.Usage.InputTokens, event.Usage.OutputTokens,
+					event.Usage.CacheCreationInputTokens, event.Usage.CacheReadInputTokens, event.TotalCostUSD)
+				log.Printf("Token usage: model=%s input=%d output=%d cache_read=%d cache_create=%d cost=$%.4f",
 					model, event.Usage.InputTokens, event.Usage.OutputTokens,
-					event.Usage.CacheReadInputTokens, event.Usage.CacheCreationInputTokens)
+					event.Usage.CacheReadInputTokens, event.Usage.CacheCreationInputTokens, event.TotalCostUSD)
+				streamUsage = buildUsageInfo(event.Usage)
 			}
 
 			// finish_reason chunk (no usage here, vLLM style)
@@ -1452,7 +1550,7 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 					Created: created,
 					Model:   model,
 					Choices: []ChatCompletionChoice{},
-					Usage:   buildUsageInfo(event.Usage),
+					Usage:   streamUsage,
 				}
 				data, _ = json.Marshal(usageChunk)
 				fmt.Fprintf(w, "data: %s\n\n", data)
@@ -1462,7 +1560,7 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 	}
 
 	flushAggLog() // flush any remaining aggregated log
-	sessionLogDone(sessionID, nil)
+	sessionLogDone(sessionID, streamUsage)
 
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
@@ -1554,6 +1652,10 @@ func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args [
 				}
 
 			case "content_block_stop":
+				// Log tool_use with accumulated input
+				if tc, ok := nativeTCs[streamEvt.Index]; ok {
+					sessionLogToolUse(sessionID, tc.Name, tc.ID, tc.Args.String())
+				}
 				// If the completed block is AskUserQuestion, emit it and end the stream
 				if askUserIdx >= 0 && streamEvt.Index == askUserIdx {
 					tc := nativeTCs[askUserIdx]
@@ -1698,10 +1800,11 @@ func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args [
 			}
 			if event.Usage != nil {
 				finalUsage = buildUsageInfo(event.Usage)
-				globalStats.Record(model, event.Usage.InputTokens, event.Usage.OutputTokens)
-				log.Printf("Token usage: model=%s input=%d output=%d cache_read=%d cache_create=%d",
+				globalStats.Record(model, event.Usage.InputTokens, event.Usage.OutputTokens,
+					event.Usage.CacheCreationInputTokens, event.Usage.CacheReadInputTokens, event.TotalCostUSD)
+				log.Printf("Token usage: model=%s input=%d output=%d cache_read=%d cache_create=%d cost=$%.4f",
 					model, event.Usage.InputTokens, event.Usage.OutputTokens,
-					event.Usage.CacheReadInputTokens, event.Usage.CacheCreationInputTokens)
+					event.Usage.CacheReadInputTokens, event.Usage.CacheCreationInputTokens, event.TotalCostUSD)
 			}
 		}
 	}
@@ -1824,7 +1927,7 @@ func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args [
 }
 
 func handleNonStreamResponse(w http.ResponseWriter, r *http.Request, args []string, prompt string, chatID string, created int64, model string, hasTools bool, workingDir string, envVars map[string]string, sessionID string) {
-	events, lastText, result, usage, err := runClaude(args, prompt, workingDir, envVars)
+	events, lastText, result, usage, rawUsage, costUSD, err := runClaude(args, prompt, workingDir, envVars)
 	if err != nil {
 		writeOAIError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
@@ -1836,14 +1939,12 @@ func handleNonStreamResponse(w http.ResponseWriter, r *http.Request, args []stri
 	}
 
 	// Record token stats
-	if usage != nil {
-		globalStats.Record(model, usage.PromptTokens, usage.CompletionTokens)
-		cached := 0
-		if usage.PromptTokensDetails != nil {
-			cached = usage.PromptTokensDetails.CachedTokens
-		}
-		log.Printf("Token usage: model=%s prompt=%d output=%d total=%d cached=%d",
-			model, usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens, cached)
+	if rawUsage != nil {
+		globalStats.Record(model, rawUsage.InputTokens, rawUsage.OutputTokens,
+			rawUsage.CacheCreationInputTokens, rawUsage.CacheReadInputTokens, costUSD)
+		log.Printf("Token usage: model=%s input=%d output=%d cache_read=%d cache_create=%d cost=$%.4f",
+			model, rawUsage.InputTokens, rawUsage.OutputTokens,
+			rawUsage.CacheReadInputTokens, rawUsage.CacheCreationInputTokens, costUSD)
 	}
 
 	var (
@@ -1963,6 +2064,17 @@ func writeOAIError(w http.ResponseWriter, statusCode int, errType string, messag
 }
 
 func main() {
+	port := flag.String("port", "50009", "port to listen on")
+	proxy := flag.String("proxy", "", "HTTP/HTTPS proxy URL (e.g. http://127.0.0.1:7890)")
+	flag.Parse()
+
+	if *proxy != "" {
+		os.Setenv("HTTP_PROXY", *proxy)
+		os.Setenv("HTTPS_PROXY", *proxy)
+		os.Setenv("http_proxy", *proxy)
+		os.Setenv("https_proxy", *proxy)
+	}
+
 	logFile, err := os.OpenFile("claude_openai_api.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	if err != nil {
 		log.Fatalf("Failed to open log file: %v", err)
@@ -1972,6 +2084,9 @@ func main() {
 	multiWriter := io.MultiWriter(os.Stdout, logFile)
 	log.SetOutput(multiWriter)
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.Lshortfile)
+
+	// Clean up sessions older than 72 hours, check every hour.
+	globalSessionStore.startSessionCleanup(72*time.Hour, 1*time.Hour)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", chatCompletionsHandler)
@@ -1993,8 +2108,11 @@ func main() {
 		mux.ServeHTTP(w, r)
 	})
 
-	port := ":50009"
-	log.Printf("Starting Claude OpenAI-compatible API server on %s", port)
+	addr := ":" + *port
+	if *proxy != "" {
+		log.Printf("Using proxy: %s", *proxy)
+	}
+	log.Printf("Starting Claude OpenAI-compatible API server on %s", addr)
 	log.Printf("Endpoints:")
 	log.Printf("  POST /v1/chat/completions  (OpenAI-compatible chat completions, with tool calling)")
 	log.Printf("  GET  /v1/models            (Model list)")
@@ -2003,7 +2121,7 @@ func main() {
 	log.Printf("  GET  /sessions             (List all sessions)")
 	log.Printf("  GET  /session/{id}         (Session viewer with WebSocket)")
 
-	if err := http.ListenAndServe(port, handler); err != nil {
+	if err := http.ListenAndServe(addr, handler); err != nil {
 		log.Fatal(err)
 	}
 }
